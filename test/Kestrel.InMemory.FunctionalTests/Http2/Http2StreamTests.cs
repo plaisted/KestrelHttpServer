@@ -833,7 +833,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
             Assert.IsType<Http2StreamErrorException>(thrownEx.InnerException);
         }
 
-        [Fact(Skip = "Flaky test #2799, #2832")]
+        [Fact]
         public async Task ContentLength_Received_MultipleDataFramesOverSize_Reset()
         {
             IOException thrownEx = null;
@@ -858,8 +858,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
             await SendDataAsync(1, new byte[1], endStream: false);
             await SendDataAsync(1, new byte[2], endStream: false);
             await SendDataAsync(1, new byte[10], endStream: false);
-            await SendDataAsync(1, new byte[2], endStream: true);
-
             await WaitForStreamErrorAsync(1, Http2ErrorCode.PROTOCOL_ERROR, CoreStrings.Http2StreamErrorMoreDataThanLength);
 
             await StopConnectionAsync(expectedLastStreamId: 1, ignoreNonGoAwayFrames: false);

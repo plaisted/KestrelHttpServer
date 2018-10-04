@@ -4,6 +4,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipelines;
 using System.Security.Authentication;
@@ -83,6 +84,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
         private readonly TaskCompletionSource<object> _streamsCompleted = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         private readonly ConcurrentDictionary<int, Http2Stream> _streams = new ConcurrentDictionary<int, Http2Stream>();
+        // TODO: Slim down Http2Stream here to something with only the critical state.
+        private readonly ConcurrentDictionary<int, Http2Stream> _streamsCoolDown = new ConcurrentDictionary<int, Http2Stream>();
 
         public Http2Connection(HttpConnectionContext context)
         {
@@ -468,6 +471,26 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
                 return stream.OnDataAsync(_incomingFrame, payload);
             }
+            else if (_streamsCoolDown.TryGetValue(_incomingFrame.StreamId, out var _))
+            {
+                if (_incomingFrame.DataEndStream)
+                {
+                    // No more frames expected.
+                    _streamsCoolDown.TryRemove(_incomingFrame.StreamId, out var _);
+                }
+
+                // Discard data frames from streams in cool-down mode, but still update the connection window.
+                var connectionSuccess = _inputFlowControl.TryUpdateWindow(_incomingFrame.PayloadLength, out var connectionWindowUpdateSize);
+                Debug.Assert(connectionSuccess, "Connection-level input flow control should never be aborted.");
+
+                if (connectionWindowUpdateSize > 0)
+                {
+                    // Writing with the FrameWriter should only fail if given a canceled token, so just fire and forget.
+                    _ = _frameWriter.WriteWindowUpdateAsync(0, connectionWindowUpdateSize);
+                }
+
+                return Task.CompletedTask;
+            }
 
             // If we couldn't find the stream, it was either alive previously but closed with
             // END_STREAM or RST_STREAM, or it was implicitly closed when the client opened
@@ -635,6 +658,13 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                 stream.DisallowAdditionalRequestFrames();
                 stream.Abort(new IOException(CoreStrings.Http2StreamResetByClient));
             }
+            else if (_streamsCoolDown.TryRemove(_incomingFrame.StreamId, out _))
+            {
+                // This stream was aborted by the server earlier and now the client is aborting it as well. No more frames are expected.
+                // TODO: LOG?
+                // TODO: State disposal?
+            }
+            // else error? Why did we get a reset for a long closed stream?
 
             return Task.CompletedTask;
         }
@@ -966,7 +996,18 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
         {
             lock (_stateLock)
             {
-                _streams.TryRemove(streamId, out _);
+                if (_streams.TryGetValue(streamId, out var stream))
+                {
+                    if (!stream.EndStreamReceived && !stream.DoNotDrainRequest)
+                    {
+                        // TODO: Set expiration period
+                        // TODO: Scope down the object added to only the needed state
+                        _streamsCoolDown.TryAdd(streamId, stream);
+                    }
+
+                    _streams.TryRemove(streamId, out _); // Assert?
+                }
+                // else? Why wasn't it there?
 
                 if (_streams.IsEmpty)
                 {
